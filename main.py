@@ -1,12 +1,19 @@
 from huggingface_lm import HuggingFaceLanguageModel
+import sys
 import json
 
 if __name__ == "__main__":
 	epochs = 2
-	batch_size = 8
+	batch_size = 32
 	sequence_length = 8
 
-	with open("") as f:
+	try:
+		data_file = sys.argv[1]
+	except ValueError:
+		print("Need json data file")
+		exit(1)
+
+	with open(data_file) as f:
 		data = json.load(f)
 
 
