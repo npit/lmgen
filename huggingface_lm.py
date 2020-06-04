@@ -1,6 +1,6 @@
 import transformers
 from transformers.optimization import AdamW
-from transformers import BertTokenizer, BertForMaskedLM
+from transformers import BertTokenizer, BertForMaskedLM, BertModel
 from torch.utils.data import TensorDataset
 import torch
 from transformers import get_linear_schedule_with_warmup
@@ -49,7 +49,7 @@ class HuggingFaceLanguageModel(LanguageModel):
 
     def __init__(self, batch_size, sequence_length):
         print("Making tokenizer")
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True, output_hidden_states=True)
         # seqlen cannot be larger than 512 tokens
         if sequence_length > 512:
             raise ValueError("Sequence length: {sequence_length} is larger than the allowed max of 512")
@@ -57,45 +57,90 @@ class HuggingFaceLanguageModel(LanguageModel):
         self.batch_size = batch_size
 
         print("Making model")
-        self.model = BertForMaskedLM.from_pretrained("bert-base-uncased")
+        # self.model = BertForMaskedLM.from_pretrained("bert-base-uncased")
+        self.model = BertModel.from_pretrained("bert-base-uncased")
 
 
-    def prepare_data(self, data):
-        """Input data preparation function"""
-        print("Preparing data")
-        # perform sentence splitting
-        sentences = self.tokenize_sentences(data)
-        # apply maximum sentence length
-        if self.sequence_length is None:
-            max_sentence_length = max(len(sent) for sent in sentences)
-            self.sequence_length = max(max_sentence_length ,512)
+    def tokenize_sentences(self, sentences):
+        """
+        Perform tokenization with a huggingface tokenizer
 
-        print("Encoding sentences to tokens and attention masks")
-        input_ids = []
-        attention_masks = []
+        sentences: List of strings
+        Returns:
+            tokenized_sentences: List of lists of tokens
+        """
+        print("Tokenizing sentences")
+        filename = "data-tokenized.pkl"
+        tok_sentences = []
+        if exists(filename):
+            print("Loading")
+            # tok_sentences = torch.load(filename)
+            with open(filename, "rb") as f:
+                tok_sentences = pickle.load(f)
+        else:
+            tok_sentences = []
+            # tokenize
+            for sent in tqdm(sentences):
+                tok_sentences.append(self.tokenizer.tokenize(sent))
+            with open(filename, "wb") as f:
+                pickle.dump(tok_sentences, f)
+            # torch.save(filename)
+        return tok_sentences
 
+    def encode_sentences(self, data):
+
+        print("Encoding sentences")
         filename = "data-encoded.pkl"
-        # import pdb; pdb.set_trace()
         if exists(filename):
             print("Loading")
             with open(filename, "rb") as f:
                 input_ids, attention_masks = pickle.load(f)
         else:
-            for sent in tqdm(sentences):
+            # tokenize sentences
+            tokenized_sentences = self.tokenize_sentences(data)
+            del data
+
+            input_ids = []
+            attention_masks = []
+            for sent in tqdm(tokenized_sentences):
                 # Tokenize sentence and add `[CLS]` and `[SEP]` tokens.
                 encoding = self.tokenizer.encode_plus(sent, add_special_tokens=True, max_length=self.sequence_length,
                     return_attention_mask=True, return_tensors='pt', pad_to_max_length=True)
                 input_ids.append(encoding["input_ids"])
                 attention_masks.append(encoding["attention_mask"])
+            del tokenized_sentences
+
             with open(filename, "wb") as f:
                 pickle.dump((input_ids, attention_masks), f)
 
         # to torch tensors
         input_ids = torch.cat(input_ids, dim=0)
         attention_masks = torch.cat(attention_masks, dim=0)
+        return (input_ids, attention_masks)
+
+    def prepare_data(self, data, only_eval=False):
+        """Input data preparation function"""
+
+        print("Preparing data")
+        # perform sentence splitting
+        sentences = self.tokenize_sentences(data)
+        max_sentence_length = max(len(sent) for sent in sentences)
+        # apply maximum sentence length 
+        if self.sequence_length is None:
+            self.sequence_length = max_sentence_length
+        elif self.sequence_length > max_sentence_length:
+            self.sequence_length = max_sentence_length
+
+        # max sequence length in BERT
+        self.sequence_length = min(self.sequence_length, 512)
+        print("Encoding sentences to tokens and attention masks")
+        self.input_ids, self.attention_masks = self.encode_sentences(data)
 
         print("Making dataloader")
-        self.dataloader = torch.utils.data.DataLoader(TensorDataset(input_ids, attention_masks), shuffle=True)
+        if only_eval:
+            self.dataloader = torch.utils.data.DataLoader(TensorDataset(self.input_ids, self.attention_masks), batch_size=self.batch_size, shuffle=False)
+        else:
+            self.dataloader = torch.utils.data.DataLoader(TensorDataset(self.input_ids, self.attention_masks), batch_size=self.batch_size, shuffle=True)
 
     def train(self, num_epochs):
         device = configure_device()
@@ -153,7 +198,8 @@ class HuggingFaceLanguageModel(LanguageModel):
                     # Calculate elapsed time in minutes.
                     elapsed = format_time(time.time() - t0)
                     # Report progress.
-                    print('  Batch {:>5,}  of  {:>5,}. Local - accum loss: {} - {}    Elapsed: {:}.'.format(step, math.ceil(len(self.dataloader) / self.batch_size), loss.item(), total_train_loss, elapsed))
+                    print('Epoch {},  Batch {:>5,}  of  {:>5,}. Local - accum loss: {} - {}    Elapsed: {:}.'.format(ep, step, math.ceil(len(self.dataloader) / self.batch_size), loss.item(), total_train_loss, elapsed))
+            torch.save(self.model, "model_ep_{}".format(ep))
 
 
         # Calculate the average loss over all of the batches.
@@ -170,3 +216,30 @@ class HuggingFaceLanguageModel(LanguageModel):
         torch.save(model.state_dict(), ddir + self.name)
     def load(self, path):
         self.model.load_state_dict(torch.load(path))
+
+    def encode_eval_data(self):
+        outputs = torch.zeros((len(self.input_ids), 768))
+        global_idx = 0
+
+        res = []
+        device = configure_device()
+        self.model.eval()
+        with torch.no_grad():
+            with tqdm.tqdm(total=len(self.dataloader)) as pbar:
+                for i, batch in enumerate(self.dataloader):
+
+                    b_input_ids = batch[0].to(device)
+                    b_input_mask = batch[1].to(device)
+
+                    out = self.model(b_input_ids, token_type_ids=None, attention_mask=b_input_mask)
+
+                    seq_vectors = outputs[1]
+                    batch_len = len(seq_vectors)
+
+                    global_ending_idx = global_idx+batch_len
+                    outputs[global_idx:(global_ending_idx), :] = seq_vectors
+                    global_idx = global_ending_idx
+
+                    if i % 1000 == 0 and i > 0:
+                        torch.save(outputs, "results_{}".format(i))
+                    pbar.update()
